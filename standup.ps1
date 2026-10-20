@@ -1,7 +1,3 @@
-function Test-GitRepository($path) {
-    return Test-Path (Join-Path $path ".git") -PathType Container
-}
-
 function Get-PreviousWorkingDay {
     $daysToSubtract = if ((Get-Date).DayOfWeek -eq 'Sunday') { 2 }
                       elseif ((Get-Date).DayOfWeek -eq 'Monday') { 3 }
@@ -11,15 +7,29 @@ function Get-PreviousWorkingDay {
 
 $currentGitUser = git config user.name
 $yesterday = Get-PreviousWorkingDay
-$repos = Get-ChildItem -Directory -Path "D:\repositories"
+$repos = Get-ChildItem -Directory -Path "D:\repositories" | Where-Object { Test-Path (Join-Path $_.FullName ".git") -PathType Container }
 
-foreach ($repo in $repos) {
-    if (Test-GitRepository $repo.FullName) {
-        $yesterdayCommits = & git -C $repo.FullName log --branches --remotes --author="$currentGitUser" --since="$yesterday 00:00:00" --until="$yesterday 23:59:59" --format="%s"
-        
-        if ($yesterdayCommits.Count) {
-            Write-Host "`n>>>> $repo"
-            $yesterdayCommits | ForEach-Object { Write-Host "- $_" }
-        }
+# run git log for all repos in parallel, git process startup dominates the runtime on Windows
+$pool = [runspacefactory]::CreateRunspacePool(1, [Environment]::ProcessorCount * 2)
+$pool.Open()
+
+$jobs = foreach ($repo in $repos) {
+    $ps = [powershell]::Create().AddScript({
+        param($path, $author, $day)
+        & git -C $path log --branches --remotes --author="$author" --since="$day 00:00:00" --until="$day 23:59:59" --format="%s"
+    }).AddArgument($repo.FullName).AddArgument($currentGitUser).AddArgument($yesterday)
+    $ps.RunspacePool = $pool
+    [pscustomobject]@{ Repo = $repo; PS = $ps; Handle = $ps.BeginInvoke() }
+}
+
+foreach ($job in $jobs) {
+    $yesterdayCommits = $job.PS.EndInvoke($job.Handle)
+    $job.PS.Dispose()
+
+    if ($yesterdayCommits.Count) {
+        Write-Host "`n>>>> $($job.Repo)"
+        $yesterdayCommits | ForEach-Object { Write-Host "- $_" }
     }
 }
+
+$pool.Close()
